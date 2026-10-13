@@ -13,19 +13,13 @@ locals {
   }
 }
 
-# Runtime identity for the service. Separate from the CI service account:
-# CI deploys, this one runs. It gets only what the app needs.
-resource "google_service_account" "runtime" {
-  account_id   = "apoc-${var.app}-${var.env_name}"
-  display_name = "Runtime identity for ${local.service_name}"
-  description  = "Used by the Cloud Run service itself. Managed by agentic-poc."
-}
-
-resource "google_project_iam_member" "runtime_firestore" {
-  project = var.project_id
-  role    = "roles/datastore.user"
-  member  = "serviceAccount:${google_service_account.runtime.email}"
-}
+# The runtime identity is NOT created here. install.sh creates it and grants
+# it datastore.user, because managing project IAM from Terraform would require
+# the CI identity to hold resourcemanager.projectIamAdmin - a role that can
+# grant any role to any principal, including owner.
+#
+# Terraform therefore creates no IAM at all beyond the service's own invoker
+# binding. The CI identity cannot mint identities or widen permissions.
 
 resource "google_cloud_run_v2_service" "app" {
   name     = local.service_name
@@ -38,7 +32,7 @@ resource "google_cloud_run_v2_service" "app" {
   deletion_protection = false
 
   template {
-    service_account = google_service_account.runtime.email
+    service_account = var.runtime_service_account
     labels          = local.labels
 
     scaling {

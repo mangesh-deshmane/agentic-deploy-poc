@@ -60,6 +60,16 @@ variable "image" {
   default     = "gcr.io/cloudrun/hello"
 }
 
+variable "runtime_service_account" {
+  type        = string
+  description = "Identity the container runs as. Created by install.sh, not by Terraform."
+
+  validation {
+    condition     = can(regex("^apoc-(app1|app2)-runtime@", var.runtime_service_account))
+    error_message = "Must be one of the apoc-<app>-runtime identities created by install.sh."
+  }
+}
+
 # ---- cost guardrails -------------------------------------------------------
 # These defaults are the free-tier contract. The policy gate in Phase 2 asserts
 # the same values against the plan JSON, so a change here alone will not pass.

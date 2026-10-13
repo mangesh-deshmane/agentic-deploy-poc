@@ -9,8 +9,8 @@ output "service_name" {
 }
 
 output "runtime_service_account" {
-  description = "Identity the container runs as."
-  value       = google_service_account.runtime.email
+  description = "Identity the container runs as (created by install.sh)."
+  value       = var.runtime_service_account
 }
 
 output "health_url" {

@@ -13,6 +13,9 @@ env_name = "dev"
 
 image = "ghcr.io/mangesh-deshmane/app1:sha-2a07e91"
 
+# Created by install.sh. Terraform references it but cannot create or alter it.
+runtime_service_account = "apoc-app1-runtime@agentic-poc-5b8b.iam.gserviceaccount.com"
+
 min_instance_count = 0
 max_instance_count = 2
 memory             = "512Mi"

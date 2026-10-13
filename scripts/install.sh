@@ -163,12 +163,17 @@ else
   ok "created $SA_EMAIL"
 fi
 
-# Project-level roles. Deliberately narrow: no owner, no editor.
+# Project-level roles. Deliberately minimal.
+#
+# Notably ABSENT:
+#   resourcemanager.projectIamAdmin - could grant itself owner
+#   iam.serviceAccountAdmin         - could mint new identities
+#   datastore.owner                 - CI has no business reading app data
+#
+# serviceAccountUser is granted per runtime identity below, not project-wide,
+# so CI can deploy AS those identities and no others.
 ROLES=(
   roles/run.admin
-  roles/iam.serviceAccountUser
-  roles/iam.serviceAccountAdmin
-  roles/datastore.owner
   roles/serviceusage.serviceUsageConsumer
 )
 for role in "${ROLES[@]}"; do
@@ -190,6 +195,50 @@ if retry gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
 else
   die "could not grant bucket access after retries. Re-run ./install.sh."
 fi
+
+# ---------- runtime identities ----------
+# One per app, created here rather than by Terraform. Terraform would need
+# project-level IAM admin to grant datastore.user, and that role can grant ANY
+# role to ANY principal - a CI identity holding it could make itself owner.
+#
+# Keeping these out of Terraform means the CI service account never needs to
+# write project IAM at all. Per-environment isolation is at the Firestore
+# collection level (app-customer-env-items), which the app enforces itself.
+say "Runtime identities"
+for app in app1 app2; do
+  RT_NAME="${PREFIX}-${app}-runtime"
+  RT_EMAIL="${RT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+  if gcloud iam service-accounts describe "$RT_EMAIL" --project="$PROJECT_ID" >/dev/null 2>&1; then
+    skip "$RT_EMAIL"
+  else
+    gcloud iam service-accounts create "$RT_NAME" \
+      --project="$PROJECT_ID" \
+      --display-name="Runtime identity for ${app}" \
+      --description="What the ${app} container runs as. Managed by agentic-poc."
+    ok "created $RT_EMAIL"
+  fi
+
+  if retry gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+       --member="serviceAccount:${RT_EMAIL}" \
+       --role="roles/datastore.user" \
+       --condition=None; then
+    ok "roles/datastore.user -> ${app} runtime"
+  else
+    die "could not grant datastore.user to $RT_EMAIL. Re-run ./install.sh."
+  fi
+
+  # CI must be able to run services AS this identity, but cannot change what
+  # the identity is allowed to do.
+  if retry gcloud iam service-accounts add-iam-policy-binding "$RT_EMAIL" \
+       --project="$PROJECT_ID" \
+       --member="serviceAccount:${SA_EMAIL}" \
+       --role="roles/iam.serviceAccountUser"; then
+    ok "CI may deploy as ${app} runtime"
+  else
+    die "could not let CI use $RT_EMAIL. Re-run ./install.sh."
+  fi
+done
 
 # ---------- Workload Identity Federation ----------
 say "Workload Identity Federation"
@@ -214,9 +263,22 @@ fi
 
 POOL_NAME="projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_ID}"
 
+# Deleting a pool soft-deletes its providers too, and `describe` still returns
+# a deleted provider - so an existence check alone silently leaves federation
+# broken, and the only symptom is an "invalid audience" error at CI time.
 if gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
      --project="$PROJECT_ID" --location=global --workload-identity-pool="$POOL_ID" >/dev/null 2>&1; then
-  skip "provider $PROVIDER_ID"
+  PSTATE=$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+             --project="$PROJECT_ID" --location=global \
+             --workload-identity-pool="$POOL_ID" --format="value(state)")
+  if [ "$PSTATE" = "DELETED" ]; then
+    warn "provider $PROVIDER_ID is soft-deleted; undeleting (30-day window)"
+    gcloud iam workload-identity-pools providers undelete "$PROVIDER_ID" \
+      --project="$PROJECT_ID" --location=global --workload-identity-pool="$POOL_ID"
+    ok "undeleted $PROVIDER_ID"
+  else
+    skip "provider $PROVIDER_ID"
+  fi
 else
   # The attribute-condition is the security boundary. Without it, ANY GitHub
   # repository on earth can impersonate this service account.
@@ -237,6 +299,20 @@ if retry gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
   ok "bound ${GITHUB_REPO} -> ${SA_EMAIL}"
 else
   die "could not bind the federated identity after retries. Re-run ./install.sh."
+fi
+
+# Federation is the one thing here whose breakage only shows up later, in CI,
+# as an opaque "invalid audience". Assert it is actually usable now.
+POOL_STATE=$(gcloud iam workload-identity-pools describe "$POOL_ID" \
+  --project="$PROJECT_ID" --location=global --format="value(state)" 2>/dev/null)
+PROV_STATE=$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+  --project="$PROJECT_ID" --location=global \
+  --workload-identity-pool="$POOL_ID" --format="value(state)" 2>/dev/null)
+
+if [ "$POOL_STATE" = "ACTIVE" ] && [ "$PROV_STATE" = "ACTIVE" ]; then
+  ok "federation verified: pool and provider both ACTIVE"
+else
+  die "federation is not usable - pool=${POOL_STATE:-missing} provider=${PROV_STATE:-missing}. CI auth will fail with 'invalid audience'."
 fi
 
 # ---------- budget tripwire ----------
@@ -305,6 +381,13 @@ $(printf '\033[1m')GitHub Actions secrets$(printf '\033[0m') - add these as repo
   GCP_WIF_PROVIDER     ${POOL_NAME}/providers/${PROVIDER_ID}
   GCP_CI_SA            ${SA_EMAIL}
   GCP_STATE_BUCKET     ${STATE_BUCKET}
+
+$(printf '\033[1m')Runtime identities$(printf '\033[0m') - put the matching one in each envs/*.tfvars:
+
+  app1   ${PREFIX}-app1-runtime@${PROJECT_ID}.iam.gserviceaccount.com
+  app2   ${PREFIX}-app2-runtime@${PROJECT_ID}.iam.gserviceaccount.com
+
+  CI can deploy as these, but cannot change what they are allowed to do.
 
 Next:  ./status.sh
 SUMMARY
