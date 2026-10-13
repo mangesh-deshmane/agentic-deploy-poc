@@ -1,0 +1,10 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+.platform-state/
+.env
+*.pem
+*-key.json
+node_modules/

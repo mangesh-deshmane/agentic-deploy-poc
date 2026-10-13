@@ -1,0 +1,81 @@
+name: build-app1
+
+# Phase 1b: build the image only. No deployment here - Terraform is still run
+# by hand. Phase 2 adds plan, policy gate, approval and apply.
+#
+# Built on GitHub's runners rather than locally so the image is always
+# linux/amd64, which is what Cloud Run requires. Building on an ARM laptop
+# produces an image that fails at runtime with an unhelpful error.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app1/**'
+      - '.github/workflows/build-app1.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/app1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # GITHUB_TOKEN can write packages - no personal access token needed,
+      # which means no long-lived credential on anyone's disk.
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app1
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache in GitHub Actions - free, and cuts rebuilds to under
+          # a minute once node_modules has been resolved once.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report image reference
+        run: |
+          {
+            echo "### App1 image built"
+            echo ""
+            echo "Pin Terraform to the digest, not the tag - a tag can move,"
+            echo "which makes a rollback impossible to reason about."
+            echo ""
+            echo '```'
+            echo 'image = "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"'
+            echo '```'
+            echo ""
+            echo "Tags pushed:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

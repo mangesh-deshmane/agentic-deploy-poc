@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>App1 — Reporting Service</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --line:#e2e5ea; --ink:#15181d; --muted:#626b7a;
+    --accent:#1f6feb; --ok:#108043;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#0e1116; --card:#161b22; --line:#262c36; --ink:#e6edf3; --muted:#8b949e;
+           --accent:#539bf5; --ok:#3fb950; color-scheme:dark; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:32px 20px 56px}
+  header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font-size:22px;margin:0;letter-spacing:-.01em}
+  .pill{font:600 11px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;
+        padding:5px 9px;border-radius:20px;background:var(--accent);color:#fff}
+  .sub{color:var(--muted);margin:0 0 26px;font-size:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:18px}
+  h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 14px;font-weight:600}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}
+  .f{min-width:0}
+  .k{font-size:11px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase}
+  .v{font:500 14px/1.4 var(--mono);word-break:break-word;margin-top:3px}
+  form{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+  input{flex:1 1 180px;min-width:0;padding:9px 11px;border:1px solid var(--line);border-radius:7px;
+        background:var(--bg);color:var(--ink);font:14px system-ui,sans-serif}
+  input:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  button{padding:9px 16px;border:0;border-radius:7px;background:var(--accent);color:#fff;
+         font:600 14px system-ui,sans-serif;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  ul{list-style:none;margin:0;padding:0}
+  li{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;
+     padding:11px 0;border-bottom:1px solid var(--line)}
+  li:last-child{border-bottom:0}
+  .nm{font-weight:600}
+  .nt{color:var(--muted);font-size:13px}
+  .ts{font:11px var(--mono);color:var(--muted);white-space:nowrap}
+  .del{background:none;color:var(--muted);font-size:17px;padding:0 4px;line-height:1}
+  .del:hover{color:#d1242f}
+  .empty{color:var(--muted);font-size:14px;padding:6px 0}
+  footer{color:var(--muted);font-size:12px;text-align:center;margin-top:28px}
+  code{font:12px var(--mono);background:var(--bg);border:1px solid var(--line);
+       border-radius:4px;padding:1px 5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Reporting Service</h1>
+    <span class="pill" id="pill">app1</span>
+  </header>
+  <p class="sub">Deployed to Cloud Run by the agentic platform. Data persists in Firestore.</p>
+
+  <div class="card">
+    <h2>Deployment</h2>
+    <div class="grid" id="info">
+      <div class="f"><div class="k">Loading</div><div class="v">&hellip;</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Items</h2>
+    <form id="form">
+      <input id="name" placeholder="Item name" maxlength="120" required>
+      <input id="note" placeholder="Note (optional)" maxlength="500">
+      <button type="submit" id="add">Add</button>
+    </form>
+    <ul id="list"><li class="empty">Loading&hellip;</li></ul>
+  </div>
+
+  <footer>
+    <code>/health</code> &middot; <code>/api/info</code> &middot; <code>/api/items</code>
+  </footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function loadInfo() {
+  try {
+    const r = await fetch('/api/info');
+    const d = await r.json();
+    $('pill').textContent = d.customer + ' / ' + d.environment;
+    const fields = [
+      ['Customer', d.customer], ['Environment', d.environment],
+      ['Cloud', d.cloud], ['Platform', d.platform],
+      ['Runtime', d.runtime], ['Data store', d.dataStore],
+      ['Region', d.region], ['Revision', d.revision]
+    ];
+    $('info').innerHTML = fields.map(([k, v]) =>
+      `<div class="f"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join('');
+  } catch {
+    $('info').innerHTML = '<div class="f"><div class="k">Error</div><div class="v">could not load</div></div>';
+  }
+}
+
+async function loadItems() {
+  try {
+    const r = await fetch('/api/items');
+    const d = await r.json();
+    if (!d.items || !d.items.length) {
+      $('list').innerHTML = '<li class="empty">No items yet. Add one above.</li>';
+      return;
+    }
+    $('list').innerHTML = d.items.map((it) => `
+      <li>
+        <div>
+          <div class="nm">${esc(it.name)}</div>
+          ${it.note ? `<div class="nt">${esc(it.note)}</div>` : ''}
+          <div class="ts">${esc((it.createdAt || '').replace('T', ' ').slice(0, 19))} UTC</div>
+        </div>
+        <button class="del" data-id="${esc(it.id)}" title="Delete">&times;</button>
+      </li>`).join('');
+  } catch {
+    $('list').innerHTML = '<li class="empty">Could not load items.</li>';
+  }
+}
+
+$('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = $('name').value.trim();
+  if (!name) return;
+  $('add').disabled = true;
+  try {
+    await fetch('/api/items', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, note: $('note').value.trim() })
+    });
+    $('name').value = ''; $('note').value = '';
+    await loadItems();
+  } finally {
+    $('add').disabled = false;
+  }
+});
+
+$('list').addEventListener('click', async (e) => {
+  const id = e.target.dataset && e.target.dataset.id;
+  if (!id) return;
+  await fetch('/api/items/' + encodeURIComponent(id), { method: 'DELETE' });
+  loadItems();
+});
+
+loadInfo();
+loadItems();
+</script>
+</body>
+</html>
