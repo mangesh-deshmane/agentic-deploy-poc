@@ -1,0 +1,136 @@
+name: apply
+
+# Stage 2 of 2. Applies a plan that the plan workflow already produced and the
+# policy gate already passed.
+#
+# It does NOT re-plan. The plan file is downloaded from the run you name, so
+# what gets applied is exactly what was reviewed. This is what makes the
+# approval real rather than advisory: the agent can ask for an apply, but it
+# cannot change what the apply will do.
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, test]
+      plan_run_id:
+        description: 'Run id of the plan workflow whose plan to apply'
+        required: true
+        type: string
+      approver:
+        description: 'Who approved this (recorded in the audit trail)'
+        required: true
+        type: string
+      correlation_id:
+        description: 'Correlation id from the originating request'
+        required: false
+        default: 'manual'
+        type: string
+
+run-name: apply-${{ inputs.env_name }}-${{ inputs.correlation_id }}-by-${{ inputs.approver }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ENV_NAME: ${{ inputs.env_name }}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the approved plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.env_name }}
+          path: terraform
+          run-id: ${{ inputs.plan_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the plan still passes policy
+        run: |
+          pip install --quiet pyyaml
+          # Re-checked here deliberately. The artifact could in principle be
+          # from a run whose policy version differed; this makes the gate
+          # unavoidable rather than merely upstream.
+          python3 policy/check_plan.py terraform/tfplan.json --policy policy/policy.yaml --no-colour
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ vars.GCP_STATE_BUCKET }}" \
+            -backend-config="prefix=state/${ENV_NAME}"
+
+      # The saved plan file is the argument. No -var, no -var-file: those would
+      # be ignored anyway, which is the point - the plan is immutable.
+      - name: Terraform apply
+        id: apply
+        working-directory: terraform
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Capture outputs
+        id: out
+        working-directory: terraform
+        run: |
+          URL=$(terraform output -raw service_url 2>/dev/null || echo "")
+          echo "service_url=$URL" >> "$GITHUB_OUTPUT"
+
+      # Proves the deployment is not merely created but working, and that it
+      # was parameterised correctly - /api/info echoes the customer and env.
+      - name: Validate
+        id: validate
+        run: |
+          URL="${{ steps.out.outputs.service_url }}"
+          [ -n "$URL" ] || { echo "::error::no service_url in outputs"; exit 1; }
+
+          echo "Polling $URL/health (cold start can take 30s)"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL/health" || echo 000)
+            if [ "$CODE" = "200" ]; then echo "healthy after ${i} attempt(s)"; break; fi
+            [ "$i" = "30" ] && { echo "::error::never became healthy (last: $CODE)"; exit 1; }
+            sleep 3
+          done
+
+          INFO=$(curl -s --max-time 10 "$URL/api/info")
+          echo "$INFO"
+          EXPECT_ENV="${ENV_NAME}"
+          echo "$INFO" | grep -q "\"environment\":\"${EXPECT_ENV}\"" \
+            || { echo "::error::/api/info does not report environment=${EXPECT_ENV}"; exit 1; }
+          echo "info_json<<EOF" >> "$GITHUB_OUTPUT"; echo "$INFO" >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Apply: \`${ENV_NAME}\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Approved by | ${{ inputs.approver }} |"
+            echo "| Plan from run | ${{ inputs.plan_run_id }} |"
+            echo "| Correlation id | ${{ inputs.correlation_id }} |"
+            echo "| Result | ${{ steps.apply.outcome }} |"
+            echo "| Validation | ${{ steps.validate.outcome }} |"
+            echo "| URL | ${{ steps.out.outputs.service_url }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

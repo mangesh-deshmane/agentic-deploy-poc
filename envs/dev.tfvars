@@ -11,7 +11,7 @@ app      = "app1"
 customer = "demo"
 env_name = "dev"
 
-image = "gcr.io/cloudrun/hello"
+image = "ghcr.io/mangesh-deshmane/app1:sha-2a07e91"
 
 min_instance_count = 0
 max_instance_count = 2

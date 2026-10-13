@@ -1,0 +1,111 @@
+# Policy as data. check_plan.py evaluates this against the Terraform plan JSON.
+#
+# Keeping the rules in a data file rather than hardcoded means the Phase-2
+# story is "swap the evaluator for OPA, keep this file" rather than a rewrite.
+#
+# This is evaluated against `terraform show -json tfplan` - what Terraform is
+# ACTUALLY about to create - not against the .tf files. Checking .tf source is
+# trivially bypassed by a variable value.
+
+version: 1
+
+# Only these resource types may be created. Anything else fails the build.
+allowed_resource_types:
+  - google_cloud_run_v2_service
+  - google_cloud_run_v2_service_iam_member
+  - google_service_account
+  - google_project_iam_member
+  - google_firestore_index
+  # AWS, from Phase 5
+  - aws_lambda_function
+  - aws_lambda_function_url
+  - aws_dynamodb_table
+  - aws_iam_role
+  - aws_iam_role_policy
+  - aws_iam_role_policy_attachment
+  - aws_cloudwatch_log_group
+
+# Named explicitly so the failure message can say what it costs. Anything not
+# on the allowlist is denied anyway; this list exists to produce a useful
+# error instead of a generic one.
+denied_resource_types:
+  google_container_cluster:        "GKE cluster - nodes bill continuously, roughly $25-50/month"
+  google_container_node_pool:      "GKE node pool - bills per node-hour"
+  google_sql_database_instance:    "Cloud SQL - no free tier"
+  google_compute_instance:         "Compute VM - bills per hour"
+  google_compute_address:          "Static IP - bills when reserved"
+  google_compute_global_address:   "Global static IP - bills when reserved"
+  google_compute_forwarding_rule:  "Load balancer - roughly $18/month"
+  google_compute_router_nat:       "Cloud NAT - roughly $32/month"
+  google_vpc_access_connector:     "Serverless VPC connector - billed VMs, roughly $9/month"
+  google_redis_instance:           "Memorystore - no free tier"
+  aws_eks_cluster:                 "EKS - roughly $73/month for the control plane alone"
+  aws_ecs_service:                 "ECS/Fargate - no free tier, no scale to zero"
+  aws_apprunner_service:           "App Runner - no free tier"
+  aws_nat_gateway:                 "NAT gateway - roughly $32/month"
+  aws_lb:                          "Application Load Balancer - roughly $16/month"
+  aws_db_instance:                 "RDS - no always-free tier"
+  aws_instance:                    "EC2 - bills per hour"
+  aws_eip:                         "Elastic IP - bills when unattached"
+
+# Value constraints per resource type. A resource can be of an allowed type
+# and still cost money - min_instance_count = 1 is the obvious case.
+value_rules:
+  google_cloud_run_v2_service:
+    - path: template.scaling[0].min_instance_count
+      op: equals
+      value: 0
+      reason: "A warm instance bills continuously, roughly $13/month. Scale to zero is the free-tier contract."
+    - path: template.scaling[0].max_instance_count
+      op: max
+      value: 3
+      reason: "More than 3 instances risks exceeding the 180,000 vCPU-second monthly free allowance."
+    - path: location
+      op: in
+      value: [us-central1, asia-south1]
+      reason: "Region not allowlisted. Free-tier behaviour and state locality are only verified for these."
+    - path: template.containers[0].resources[0].limits.memory
+      op: in
+      value: ["256Mi", "512Mi"]
+      reason: "Larger instances consume the free GiB-second allowance faster."
+    - path: template.containers[0].resources[0].limits.cpu
+      op: in
+      value: ["1"]
+      reason: "More than 1 vCPU burns the free vCPU-second allowance."
+    - path: template.containers[0].resources[0].cpu_idle
+      op: equals
+      value: true
+      reason: "Without cpu_idle, CPU bills for the whole instance lifetime rather than per request."
+
+  aws_dynamodb_table:
+    - path: billing_mode
+      op: equals
+      value: "PROVISIONED"
+      reason: "On-demand bills per request from the first write. The always-free tier covers provisioned capacity only."
+    - path: read_capacity
+      op: max
+      value: 25
+      reason: "The always-free allowance is 25 read capacity units."
+    - path: write_capacity
+      op: max
+      value: 25
+      reason: "The always-free allowance is 25 write capacity units."
+
+  aws_lambda_function:
+    - path: memory_size
+      op: max
+      value: 512
+      reason: "Larger memory consumes the 400,000 GB-second monthly free allowance faster."
+
+# Resources that must carry these labels, so destroy.sh can sweep orphans that
+# a partial apply left outside Terraform state.
+required_labels:
+  google_cloud_run_v2_service:
+    - managed-by
+    - env
+    - customer
+
+# Advisory only - reported, does not fail the build.
+warn_on:
+  - condition: public_ingress
+    message: "Service is publicly reachable (allUsers invoker). Correct for a sales demo, not for production."
