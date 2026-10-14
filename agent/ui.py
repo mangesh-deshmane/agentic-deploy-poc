@@ -34,7 +34,7 @@ st.set_page_config(page_title="Deploy", page_icon="▲", layout="wide")
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(override=True)
 except ImportError:
     pass
 

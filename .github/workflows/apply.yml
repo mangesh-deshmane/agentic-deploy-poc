@@ -116,11 +116,24 @@ jobs:
             sleep 3
           done
 
+          # Expected values come from the tfvars file, not from the file stem:
+          # the stem is dev-app1-acme while the environment is dev. Reading the
+          # source of truth also means this asserts what was actually planned.
+          EXPECT_ENV=$(grep -oP '^env_name\s*=\s*"\K[a-z0-9-]+' "envs/${ENV_NAME}.tfvars")
+          EXPECT_CUST=$(grep -oP '^customer\s*=\s*"\K[a-z0-9-]+' "envs/${ENV_NAME}.tfvars")
+          EXPECT_APP=$(grep -oP '^app\s*=\s*"\K[a-z0-9]+' "envs/${ENV_NAME}.tfvars")
+
           INFO=$(curl -s --max-time 10 "$URL/api/info")
           echo "$INFO"
-          EXPECT_ENV="${ENV_NAME}"
-          echo "$INFO" | grep -q "\"environment\":\"${EXPECT_ENV}\"" \
-            || { echo "::error::/api/info does not report environment=${EXPECT_ENV}"; exit 1; }
+
+          fail=0
+          for pair in "environment:$EXPECT_ENV" "customer:$EXPECT_CUST" "app:$EXPECT_APP"; do
+            key="${pair%%:*}"; want="${pair#*:}"
+            echo "$INFO" | grep -q "\"$key\":\"$want\"" || {
+              echo "::error::/api/info reports the wrong $key (expected $want)"; fail=1; }
+          done
+          [ "$fail" = "0" ] || exit 1
+          echo "Parameterisation verified: app=$EXPECT_APP customer=$EXPECT_CUST env=$EXPECT_ENV"
           echo "info_json<<EOF" >> "$GITHUB_OUTPUT"; echo "$INFO" >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Summarise

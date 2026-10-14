@@ -1,0 +1,4 @@
+{"event": "dispatched", "correlation_id": "demo-f04237", "pr": "https://github.com/mangesh-deshmane/agentic-deploy-poc/pull/1", "app": "app1", "cloud": "gcp", "env": "dev", "at": "2026-10-14T06:58:33.153621+00:00"}
+{"event": "approved", "correlation_id": "demo-f04237", "approver": "mangesh", "plan_run_id": 38525395479, "at": "2026-10-14T06:59:45.182867+00:00"}
+{"event": "dispatched", "correlation_id": "demo-38c829", "pr": "https://github.com/mangesh-deshmane/agentic-deploy-poc/pull/2", "app": "app1", "cloud": "gcp", "env": "dev", "at": "2026-10-14T07:06:38.885789+00:00"}
+{"event": "approved", "correlation_id": "demo-38c829", "approver": "mangesh", "plan_run_id": 38526237904, "at": "2026-10-14T07:07:45.591407+00:00"}

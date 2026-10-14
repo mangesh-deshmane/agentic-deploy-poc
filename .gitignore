@@ -9,3 +9,4 @@ crash.log
 *-key.json
 node_modules/
 .venv/
+.streamlit/
