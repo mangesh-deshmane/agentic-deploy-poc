@@ -57,11 +57,23 @@ jobs:
             exit 1
           }
 
+          # Which application to build comes from the tfvars file itself, so
+          # one pipeline serves every blueprint and the caller cannot ask for
+          # an app the committed configuration does not name.
+          APP=$(grep -oP '^app\s*=\s*"\K[a-z0-9]+' "envs/${ENV_NAME}.tfvars" || true)
+          case "$APP" in
+            app1|app2) ;;
+            *) echo "::error::tfvars does not name a known app (got '$APP')"; exit 1 ;;
+          esac
+          test -d "$APP" || { echo "::error::source directory $APP/ not found"; exit 1; }
+
           # Values come from repository variables, written by install.sh.
           {
+            echo "app=$APP"
             echo "project_id=${{ vars.GCP_PROJECT_ID }}"
             echo "state_bucket=${{ vars.GCP_STATE_BUCKET }}"
           } >> "$GITHUB_OUTPUT"
+          echo "Building $APP for environment $ENV_NAME"
 
       # No service-account key anywhere. The runner exchanges its OIDC token
       # for short-lived GCP credentials, and the WIF provider only trusts
@@ -86,9 +98,9 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ./app1
+          context: ./${{ steps.cfg.outputs.app }}
           push: true
-          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/app1:sha-${{ github.sha }}
+          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ steps.cfg.outputs.app }}:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -109,7 +121,7 @@ jobs:
         run: |
           terraform plan -out=tfplan -input=false \
             -var-file="../envs/${ENV_NAME}.tfvars" \
-            -var="image=${{ env.REGISTRY }}/${{ github.repository_owner }}/app1@${{ steps.build.outputs.digest }}"
+            -var="image=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ steps.cfg.outputs.app }}@${{ steps.build.outputs.digest }}"
           terraform show -json tfplan > tfplan.json
 
       - name: Install policy dependencies
@@ -133,7 +145,9 @@ jobs:
               echo "Policy gate: **DENIED** - apply will not run, nothing was created"
             fi
             echo ""
-            echo "Image: \`${{ env.REGISTRY }}/${{ github.repository_owner }}/app1@${{ steps.build.outputs.digest }}\`"
+            echo "App: \`${{ steps.cfg.outputs.app }}\`"
+            echo ""
+            echo "Image: \`${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ steps.cfg.outputs.app }}@${{ steps.build.outputs.digest }}\`"
             echo ""
             echo '<details><summary>Plan output</summary>'
             echo ""

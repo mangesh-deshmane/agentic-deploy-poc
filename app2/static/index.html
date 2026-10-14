@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>App2 — Inventory Service</title>
+<style>
+  /* Deliberately a different accent from App1, so a demo audience can see at
+     a glance which application they are looking at. */
+  :root{
+    --bg:#f7f6f3; --card:#fff; --line:#e4e1db; --ink:#1a1814; --muted:#6b6459;
+    --accent:#0f7b6c; --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#14130f; --card:#1c1a16; --line:#2e2b25; --ink:#eceae4; --muted:#9a9287;
+           --accent:#3cbfa8; color-scheme:dark; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:32px 20px 56px}
+  header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font-size:22px;margin:0;letter-spacing:-.01em}
+  .pill{font:600 11px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;
+        padding:5px 9px;border-radius:20px;background:var(--accent);color:#fff}
+  .sub{color:var(--muted);margin:0 0 26px;font-size:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:18px}
+  h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 14px;font-weight:600}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}
+  .f{min-width:0}
+  .k{font-size:11px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase}
+  .v{font:500 14px/1.4 var(--mono);word-break:break-word;margin-top:3px}
+  form{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+  input{padding:9px 11px;border:1px solid var(--line);border-radius:7px;
+        background:var(--bg);color:var(--ink);font:14px system-ui,sans-serif;min-width:0}
+  #sku{flex:0 1 130px} #name{flex:1 1 180px} #qty{flex:0 1 90px}
+  input:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  button{padding:9px 16px;border:0;border-radius:7px;background:var(--accent);color:#fff;
+         font:600 14px system-ui,sans-serif;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{text-align:left;font:600 11px/1 system-ui;letter-spacing:.06em;text-transform:uppercase;
+     color:var(--muted);padding:0 0 9px}
+  td{padding:10px 0;border-top:1px solid var(--line)}
+  td.q{font:500 14px var(--mono);text-align:right;width:70px}
+  td.a{width:34px;text-align:right}
+  .del{background:none;color:var(--muted);font-size:17px;padding:0 4px;line-height:1}
+  .del:hover{color:#c0392b}
+  .sku{font:11px var(--mono);color:var(--muted)}
+  .empty{color:var(--muted);font-size:14px;padding:8px 0}
+  footer{color:var(--muted);font-size:12px;text-align:center;margin-top:28px}
+  code{font:12px var(--mono);background:var(--bg);border:1px solid var(--line);
+       border-radius:4px;padding:1px 5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Inventory Service</h1>
+    <span class="pill" id="pill">app2</span>
+  </header>
+  <p class="sub">Python service deployed to Cloud Run by the agentic platform. Stock persists in Firestore.</p>
+
+  <div class="card">
+    <h2>Deployment</h2>
+    <div class="grid" id="info">
+      <div class="f"><div class="k">Loading</div><div class="v">&hellip;</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Stock</h2>
+    <form id="form">
+      <input id="sku" placeholder="SKU" maxlength="40" required>
+      <input id="name" placeholder="Item name" maxlength="120" required>
+      <input id="qty" type="number" min="0" max="1000000" value="1" required>
+      <button type="submit" id="add">Add</button>
+    </form>
+    <table>
+      <thead><tr><th>Item</th><th style="text-align:right">Qty</th><th></th></tr></thead>
+      <tbody id="rows"><tr><td colspan="3" class="empty">Loading&hellip;</td></tr></tbody>
+    </table>
+  </div>
+
+  <footer>
+    <code>/health</code> &middot; <code>/api/info</code> &middot; <code>/api/items</code> &middot; <code>/docs</code>
+  </footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function loadInfo() {
+  try {
+    const d = await (await fetch('/api/info')).json();
+    $('pill').textContent = d.customer + ' / ' + d.environment;
+    const fields = [
+      ['Customer', d.customer], ['Environment', d.environment],
+      ['Cloud', d.cloud], ['Platform', d.platform],
+      ['Runtime', d.runtime], ['Data store', d.dataStore],
+      ['Region', d.region], ['Revision', d.revision]
+    ];
+    $('info').innerHTML = fields.map(([k, v]) =>
+      `<div class="f"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join('');
+  } catch {
+    $('info').innerHTML = '<div class="f"><div class="k">Error</div><div class="v">could not load</div></div>';
+  }
+}
+
+async function loadItems() {
+  try {
+    const d = await (await fetch('/api/items')).json();
+    if (!d.items || !d.items.length) {
+      $('rows').innerHTML = '<tr><td colspan="3" class="empty">No stock yet. Add an item above.</td></tr>';
+      return;
+    }
+    $('rows').innerHTML = d.items.map((it) => `
+      <tr>
+        <td><div>${esc(it.name)}</div><div class="sku">${esc(it.sku)}</div></td>
+        <td class="q">${esc(it.quantity)}</td>
+        <td class="a"><button class="del" data-id="${esc(it.id)}" title="Delete">&times;</button></td>
+      </tr>`).join('');
+  } catch {
+    $('rows').innerHTML = '<tr><td colspan="3" class="empty">Could not load stock.</td></tr>';
+  }
+}
+
+$('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('add').disabled = true;
+  try {
+    await fetch('/api/items', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sku: $('sku').value.trim(),
+        name: $('name').value.trim(),
+        quantity: parseInt($('qty').value, 10) || 0
+      })
+    });
+    $('sku').value = ''; $('name').value = ''; $('qty').value = '1';
+    await loadItems();
+  } finally {
+    $('add').disabled = false;
+  }
+});
+
+$('rows').addEventListener('click', async (e) => {
+  const id = e.target.dataset && e.target.dataset.id;
+  if (!id) return;
+  await fetch('/api/items/' + encodeURIComponent(id), { method: 'DELETE' });
+  loadItems();
+});
+
+loadInfo();
+loadItems();
+</script>
+</body>
+</html>

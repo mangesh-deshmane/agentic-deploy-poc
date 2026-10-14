@@ -16,10 +16,18 @@ from pydantic import BaseModel, ValidationError
 
 T = TypeVar("T", bound=BaseModel)
 
-# Free tier: 30 req/min, 1,000 req/day, 12k tokens/min. A deployment uses
-# 3-5 calls, so the ceiling is roughly 200 deploys a day.
-MODEL_INTENT = os.getenv("GROQ_MODEL_INTENT", "llama-3.3-70b-versatile")
-MODEL_FAST = os.getenv("GROQ_MODEL_FAST", "llama-3.1-8b-instant")
+# Read at CALL time, not import time. Reading at import meant a .env loaded
+# later in startup was silently ignored, and the stale default was used.
+DEFAULT_INTENT = "openai/gpt-oss-120b"
+DEFAULT_FAST = "openai/gpt-oss-20b"
+
+
+def model_intent() -> str:
+    return os.getenv("GROQ_MODEL_INTENT") or DEFAULT_INTENT
+
+
+def model_fast() -> str:
+    return os.getenv("GROQ_MODEL_FAST") or DEFAULT_FAST
 
 
 class LLMUnavailable(Exception):
@@ -52,7 +60,7 @@ def complete_json(
     Ask for JSON matching model_cls. Validates, retries once with the
     validation error appended, then gives up so the caller can fall back.
     """
-    model = model or MODEL_INTENT
+    model = model or model_intent()
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -113,7 +121,7 @@ def summarise(system: str, user: str, max_tokens: int = 300) -> str:
     """
     try:
         resp = client().chat.completions.create(
-            model=MODEL_FAST,
+            model=model_fast(),
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},

@@ -74,6 +74,14 @@ resource "google_cloud_run_v2_service" "app" {
         name  = "GCP_PROJECT"
         value = var.project_id
       }
+      # Both apps fall back to a hardcoded "us-central1" when this is unset,
+      # so without it /api/info reports the wrong region for an asia-south1
+      # deployment - in the one endpoint whose purpose is proving that the
+      # service was parameterised.
+      env {
+        name  = "GCP_REGION"
+        value = var.region
+      }
 
       startup_probe {
         http_get {

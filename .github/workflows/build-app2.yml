@@ -1,0 +1,121 @@
+name: build-app2
+
+# Mirror of build-app1.yml. Not strictly required by the deploy flow - plan.yml
+# builds whichever app the tfvars names - but running it first creates the GHCR
+# package, which is what lets you set the package public BEFORE a plan run.
+#
+# Without that, the first apply fails on an image pull that Cloud Run reports
+# only as a generic revision failure, which is a bad thing to debug live.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app2/**'
+      - '.github/workflows/build-app2.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/app2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # GITHUB_TOKEN can write packages - no personal access token needed,
+      # which means no long-lived credential on anyone's disk.
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The runner's default docker driver cannot export a build cache.
+      # setup-buildx switches to the docker-container driver, which can.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app2
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Catches the two failures that otherwise surface as an unexplained
+      # Cloud Run revision error: an image that does not start, and one that
+      # starts but never listens on $PORT.
+      - name: Smoke test the image
+        run: |
+          docker run -d --name app2 -p 8080:8080 \
+            -e PORT=8080 -e CUSTOMER=smoke -e ENVIRONMENT=ci -e APP_NAME=app2 \
+            "${REGISTRY}/${IMAGE_NAME}:sha-$(git rev-parse --short HEAD)"
+
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+              http://localhost:8080/health || echo 000)
+            [ "$CODE" = "200" ] && { echo "healthy after ${i} attempt(s)"; break; }
+            [ "$i" = "20" ] && {
+              echo "::error::container never served /health (last: $CODE)"
+              docker logs app2
+              exit 1
+            }
+            sleep 2
+          done
+
+          # Asserts the env-var plumbing the platform depends on, not just that
+          # the process is alive.
+          INFO=$(curl -s --max-time 5 http://localhost:8080/api/info)
+          echo "$INFO"
+          echo "$INFO" | grep -q '"customer":"smoke"' || {
+            echo "::error::/api/info did not echo CUSTOMER"; exit 1; }
+          echo "$INFO" | grep -q '"app":"app2"' || {
+            echo "::error::/api/info did not echo APP_NAME"; exit 1; }
+
+          echo "Structured logs:"
+          docker logs app2 | tail -5
+          docker rm -f app2 >/dev/null
+
+      - name: Report image reference
+        run: |
+          {
+            echo "### App2 image built"
+            echo ""
+            echo "Pin Terraform to the digest, not the tag - a tag can move,"
+            echo "which makes a rollback impossible to reason about."
+            echo ""
+            echo '```'
+            echo 'image = "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"'
+            echo '```'
+            echo ""
+            echo "Tags pushed:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "If this is the first build, set the package to **public**"
+            echo "before running a plan, or the apply will fail on image pull."
+          } >> "$GITHUB_STEP_SUMMARY"

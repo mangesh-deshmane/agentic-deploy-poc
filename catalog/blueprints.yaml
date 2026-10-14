@@ -15,37 +15,46 @@ blueprints:
     language: nodejs
     platform: cloud-run
     data_store: firestore
+    source_dir: app1
     terraform_dir: terraform
     image_repo: ghcr.io/mangesh-deshmane/app1
     runtime_service_account: apoc-app1-runtime
     regions: [us-central1, asia-south1]
     default_region: us-central1
 
-  app2-aws:
+  app2-gcp:
     app: app2
-    cloud: aws
+    cloud: gcp
     display_name: "App2 - Inventory Service"
-    description: "Python microservice on Lambda, DynamoDB-backed"
+    description: "Python microservice on Cloud Run, Firestore-backed"
     language: python
-    platform: lambda
-    data_store: dynamodb
-    terraform_dir: terraform-aws
-    image_repo: null          # Lambda ships a zip, not an image
-    runtime_service_account: null
-    regions: [ap-south-1, us-east-1]
-    default_region: ap-south-1
-    # Phase 5 builds this. Until then the catalog knows it exists but the
-    # module does not, so the agent correctly reports it as unavailable.
-    available: false
+    platform: cloud-run
+    data_store: firestore
+    source_dir: app2
+    terraform_dir: terraform
+    image_repo: ghcr.io/mangesh-deshmane/app2
+    runtime_service_account: apoc-app2-runtime
+    regions: [us-central1, asia-south1]
+    default_region: us-central1
 
-# Combinations deliberately absent, with the reason the agent should give.
-# Without these the rejection message is generic; with them it is specific,
-# which is the difference between "computer says no" and a useful answer.
+# Combinations deliberately absent, each with the reason the agent should
+# give. A generic "not supported" is useless to the person asking; naming the
+# actual reason is the difference between a refusal and an answer.
 known_unsupported:
-  app1-aws: "App1 is a container service built for Cloud Run. There is no AWS blueprint for it."
-  app2-gcp: "App2 is packaged as a Lambda zip. There is no Cloud Run blueprint for it."
-  app1-azure: "Azure is not a registered platform in this deployment."
-  app2-azure: "Azure is not a registered platform in this deployment."
+  app1-aws: >-
+    AWS is not provisioned in this deployment. No AWS account is federated to
+    the pipeline, no Terraform module exists for it, and no AWS resource type
+    is on the policy allowlist. Nothing was attempted.
+  app2-aws: >-
+    AWS is not provisioned in this deployment. No AWS account is federated to
+    the pipeline, no Terraform module exists for it, and no AWS resource type
+    is on the policy allowlist. Nothing was attempted.
+  app1-azure: >-
+    Azure is not a registered platform. No credentials, module or policy
+    entries exist for it.
+  app2-azure: >-
+    Azure is not a registered platform. No credentials, module or policy
+    entries exist for it.
 
 environments:
   dev:

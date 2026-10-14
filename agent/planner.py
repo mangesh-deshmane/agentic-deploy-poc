@@ -74,7 +74,10 @@ def render(req: DeployRequest, blueprint_key: str, correlation_id: str,
     customer = slug(req.customer)
     region = req.region or bp["default_region"]
 
-    env_file = f"{req.env_name.value}-{customer}"
+    # The app must be in the stem. Without it, app1 and app2 for the same
+    # customer collide on one file AND share one Terraform state prefix, so
+    # deploying the second would destroy the first.
+    env_file = f"{req.env_name.value}-{req.app.value}-{customer}"
     pid = project_id()
 
     image = f"{bp['image_repo']}:{image_tag}" if bp.get("image_repo") else ""
