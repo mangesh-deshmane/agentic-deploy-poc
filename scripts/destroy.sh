@@ -105,12 +105,26 @@ if [ -d terraform ] && [ -d envs ]; then
         act "  would run terraform destroy for $ENV_NAME"
         continue
       fi
+      # Same derivation as the destroy workflow: a tfvars predating the
+      # runtime_service_account variable would otherwise be undestroyable,
+      # and the oldest environments are exactly the ones most likely to be
+      # forgotten and left billing.
+      EXTRA=()
+      if ! grep -qE '^\s*runtime_service_account\s*=' "$f"; then
+        A=$(grep -oP '^app\s*=\s*"\K[a-z0-9]+' "$f" || true)
+        P=$(grep -oP '^project_id\s*=\s*"\K[a-z0-9-]+' "$f" || echo "$PROJECT_ID")
+        if [ -n "$A" ]; then
+          EXTRA+=(-var "runtime_service_account=apoc-${A}-runtime@${P}.iam.gserviceaccount.com")
+          warn "  $ENV_NAME predates runtime_service_account - derived apoc-${A}-runtime"
+        fi
+      fi
+
       (
         cd terraform || exit 1
         terraform init -reconfigure -upgrade=false \
           -backend-config="bucket=${STATE_BUCKET}" \
           -backend-config="prefix=state/${ENV_NAME}" >/dev/null 2>&1
-        terraform destroy -auto-approve -var-file="../${f}" >/dev/null 2>&1
+        terraform destroy -auto-approve -var-file="../${f}" "${EXTRA[@]}" >/dev/null 2>&1
       )
       if [ $? -eq 0 ]; then ok "terraform destroy $ENV_NAME"; else
         err "terraform destroy $ENV_NAME (layer 2 will sweep the remains)"

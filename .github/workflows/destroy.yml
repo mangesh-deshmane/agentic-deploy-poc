@@ -100,8 +100,27 @@ jobs:
         id: plan
         working-directory: terraform
         run: |
+          TFV="../envs/${ENV_NAME}.tfvars"
+
+          # A tfvars written before runtime_service_account existed would make
+          # a destroy impossible - you would be unable to tear down exactly the
+          # environments that are oldest. The value is derivable rather than
+          # guessable: install.sh creates apoc-<app>-runtime in this project
+          # and nothing else satisfies the variable's validation rule.
+          EXTRA=()
+          if ! grep -qE '^\s*runtime_service_account\s*=' "$TFV"; then
+            APP=$(grep -oP '^app\s*=\s*"\K[a-z0-9]+' "$TFV" || true)
+            PID=$(grep -oP '^project_id\s*=\s*"\K[a-z0-9-]+' "$TFV" || true)
+            if [ -z "$APP" ] || [ -z "$PID" ]; then
+              echo "::error::${ENV_NAME}.tfvars has no runtime_service_account and app/project_id cannot be read to derive one"
+              exit 1
+            fi
+            EXTRA+=(-var "runtime_service_account=apoc-${APP}-runtime@${PID}.iam.gserviceaccount.com")
+            echo "::warning::tfvars predates runtime_service_account - derived apoc-${APP}-runtime for the destroy"
+          fi
+
           terraform plan -destroy -out=tfdestroy -input=false \
-            -var-file="../envs/${ENV_NAME}.tfvars"
+            -var-file="$TFV" "${EXTRA[@]}"
           terraform show -json tfdestroy > tfdestroy.json
 
           COUNT=$(python3 -c "
@@ -130,7 +149,9 @@ jobs:
           APP=$(grep -oP '^app\s*=\s*"\K[a-z0-9]+' "envs/${ENV_NAME}.tfvars")
           CUST=$(grep -oP '^customer\s*=\s*"\K[a-z0-9-]+' "envs/${ENV_NAME}.tfvars")
           ENVN=$(grep -oP '^env_name\s*=\s*"\K[a-z0-9-]+' "envs/${ENV_NAME}.tfvars")
-          REGION=$(grep -oP '^region\s*=\s*"\K[a-z0-9-]+' "envs/${ENV_NAME}.tfvars")
+          # region has a Terraform default, so an older tfvars may omit it.
+          REGION=$(grep -oP '^region\s*=\s*"\K[a-z0-9-]+' "envs/${ENV_NAME}.tfvars" || true)
+          REGION="${REGION:-us-central1}"
           SVC="${APP}-${CUST}-${ENVN}"
 
           if gcloud run services describe "$SVC" \
