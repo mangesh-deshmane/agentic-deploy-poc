@@ -60,6 +60,7 @@ def init():
         "tfvars": None, "cid": None, "branch": None, "env_stem": None,
         "pr_url": None, "plan_run": None, "apply_run": None,
         "stage": "idle", "clarify": 0, "failure": None,
+        "destroy_env": None, "destroy_run": None, "destroy_cid": None,
     }.items():
         st.session_state.setdefault(k, v)
 
@@ -456,3 +457,229 @@ if stage in ("plan_failed", "apply_failed"):
         if st.button("Try again", type="primary"):
             reset_request()
             st.rerun()
+
+
+# ===================================================== environments & audit ==
+# Both panels are read-only views onto systems of record: the committed tfvars
+# files, and GitHub's own run history. Neither invents state of its own.
+
+ENVS_DIR = Path("envs")
+
+
+def local_envs() -> list[dict]:
+    """
+    Registered environments, read from the committed tfvars files.
+
+    A file here means the environment is *registered*, not necessarily that it
+    is deployed - a destroyed environment keeps its tfvars so it can be stood
+    up again. The destroy workflow fails loudly if the state is already empty,
+    which is the honest way to find out.
+    """
+    import re
+
+    rows = []
+    if not ENVS_DIR.is_dir():
+        return rows
+
+    for f in sorted(ENVS_DIR.glob("*.tfvars")):
+        text = f.read_text()
+
+        def field(key, default=""):
+            m = re.search(rf'^\s*{key}\s*=\s*"([^"]*)"', text, re.M)
+            return m.group(1) if m else default
+
+        protected = bool(re.search(r'^\s*protected\s*=\s*true', text, re.M))
+        rows.append({
+            "stem": f.stem,
+            "app": field("app"),
+            "customer": field("customer"),
+            "env": field("env_name"),
+            "region": field("region"),
+            "protected": protected,
+            "service": f'{field("app")}-{field("customer")}-{field("env_name")}',
+        })
+    return rows
+
+
+def environments_panel():
+    envs = local_envs()
+    if not envs:
+        st.caption("No environments registered yet.")
+        return
+
+    for e in envs:
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            st.markdown(f"**`{e['service']}`**")
+            st.caption(
+                f"{e['app']} · {e['customer']} · {e['env']} · {e['region']}"
+                + (" · protected" if e["protected"] else "")
+            )
+        with c2:
+            if e["protected"]:
+                st.button("Protected", key=f"d-{e['stem']}", disabled=True,
+                          use_container_width=True)
+            elif st.button("Destroy", key=f"d-{e['stem']}",
+                           use_container_width=True):
+                st.session_state.destroy_env = e
+                st.session_state.stage = "destroy_confirm"
+                st.rerun()
+
+    st.caption(
+        "A listed environment is one with a committed tfvars file. After a "
+        "teardown the file stays, so the environment can be recreated - "
+        "remove it in a pull request to retire it for good."
+    )
+
+
+def audit_panel():
+    try:
+        rows = gh().list_runs()
+    except GitHubError as err:
+        st.error(str(err))
+        return
+
+    rows = [r for r in rows if r["action"]]
+    if not rows:
+        st.caption("No deployment activity yet.")
+        return
+
+    icon = {"success": "✅", "failure": "❌", "cancelled": "⬜"}
+    table = []
+    for r in rows[:25]:
+        table.append({
+            "": icon.get(r["conclusion"], "⏳"),
+            "Action": r["action"],
+            "Environment": r["env"],
+            "Approved by": r["approver"] or "—",
+            "Requested by": r["actor"] or "—",
+            "Correlation": r["cid"],
+            "When": (r["created_at"] or "")[:16].replace("T", " "),
+            "Run": r["url"],
+        })
+
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        column_config={"Run": st.column_config.LinkColumn("Run", display_text="open")},
+    )
+    st.caption(
+        "Read from GitHub's run history. The approver is written into the run "
+        "name by GitHub when the workflow is queued, so it cannot be altered "
+        "afterwards - not by this agent, and not from this machine."
+    )
+
+
+# ---- 8. destroy: confirm --------------------------------------------------
+if stage == "destroy_confirm":
+    e = st.session_state.destroy_env
+    with st.chat_message("assistant"):
+        st.warning(f"**Destroy `{e['service']}`?**")
+        st.caption(
+            "This removes the Cloud Run service and everything else in that "
+            "environment's Terraform state. Documents already written to "
+            "Firestore are not removed by this."
+        )
+        typed = st.text_input(
+            f"Type `{e['stem']}` to confirm", key="destroy_confirm_text")
+        a, b = st.columns(2)
+        approver = os.getenv("APPROVER", "operator")
+
+        if a.button("Destroy environment", type="primary",
+                    use_container_width=True,
+                    disabled=(typed != e["stem"])):
+            try:
+                cid = f"{e['customer']}-{uuid.uuid4().hex[:6]}"
+                st.session_state.destroy_cid = cid
+                st.session_state.destroy_run = None
+                gh().dispatch("destroy.yml", "main", {
+                    "env_name": e["stem"],
+                    "confirm": e["stem"],
+                    "approver": approver,
+                    "correlation_id": cid,
+                })
+                say("user", f"destroy {e['service']}")
+                say("assistant", f"Teardown approved by **{approver}**.")
+                log({"event": "destroy_requested", "cid": cid,
+                     "env": e["stem"], "approver": approver})
+                st.session_state.stage = "destroying"
+                st.rerun()
+            except GitHubError as err:
+                st.error(str(err))
+
+        if b.button("Cancel", use_container_width=True):
+            st.session_state.destroy_env = None
+            st.session_state.stage = "idle"
+            st.rerun()
+
+# ---- 9. destroy: running --------------------------------------------------
+if stage == "destroying":
+    with st.chat_message("assistant"):
+        @st.fragment(run_every=4)
+        def watch_destroy():
+            try:
+                g = gh()
+                if st.session_state.destroy_run is None:
+                    r = g.find_run("destroy.yml", st.session_state.destroy_cid,
+                                   timeout=4)
+                    if not r:
+                        st.caption("waiting for the run to start…")
+                        return
+                    st.session_state.destroy_run = r.id
+
+                run, failed = show_run(st.session_state.destroy_run, "Destroy")
+                if run.finished:
+                    if run.ok:
+                        st.session_state.stage = "destroyed"
+                    else:
+                        st.session_state.failure = explain_failure(
+                            st.session_state.destroy_run, failed)
+                        st.session_state.stage = "destroy_failed"
+                    st.rerun()
+            except GitHubError as err:
+                st.error(str(err))
+        watch_destroy()
+
+# ---- 10. destroy: outcome -------------------------------------------------
+if stage == "destroyed":
+    e = st.session_state.destroy_env or {}
+    with st.chat_message("assistant"):
+        st.success(f"**`{e.get('service','the environment')}` is gone.**")
+        st.caption(
+            "Terraform destroyed the resources and the workflow then confirmed "
+            "with gcloud that the service no longer exists - a destroy that "
+            "reports success without checking is not a teardown."
+        )
+        if st.button("Done", type="primary"):
+            st.session_state.destroy_env = None
+            st.session_state.stage = "idle"
+            st.rerun()
+
+if stage == "destroy_failed":
+    step, lines = st.session_state.failure or ("unknown", [])
+    with st.chat_message("assistant"):
+        st.error(f"**Teardown failed at: {step}**")
+        if lines:
+            st.code("\n".join(lines), language="text")
+        st.caption(
+            "Resources may be partly removed. Run `./scripts/destroy.sh` "
+            "locally - it sweeps by label rather than by Terraform state, so "
+            "it catches whatever this left behind."
+        )
+        st.markdown(
+            f"[Full log](https://github.com/{os.getenv('GITHUB_REPO','')}"
+            f"/actions/runs/{st.session_state.destroy_run})")
+        if st.button("Back", type="primary"):
+            st.session_state.destroy_env = None
+            st.session_state.stage = "idle"
+            st.rerun()
+
+# ---- panels, shown when nothing is in flight ------------------------------
+if stage in ("idle", "clarify"):
+    st.divider()
+    t1, t2 = st.tabs(["Environments", "Audit trail"])
+    with t1:
+        environments_panel()
+    with t2:
+        audit_panel()

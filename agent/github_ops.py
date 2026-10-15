@@ -145,6 +145,89 @@ class GitHub:
             })
         return out
 
+    # ---- audit trail ----
+    # The run name is the audit record. GitHub writes it from the dispatch
+    # inputs at queue time, so the approver and correlation id in it cannot be
+    # edited afterwards by anyone - including by this agent. That is why the
+    # trail is read back from here rather than from the local runs.jsonl,
+    # which is just a convenience log on one laptop.
+    AUDIT_WORKFLOWS = ("plan.yml", "apply.yml", "destroy.yml")
+
+    @staticmethod
+    def parse_run_name(name: str) -> dict:
+        """
+        Pull the fields back out of a run name, parsing from the right because
+        the environment stem itself contains hyphens.
+
+            apply-dev-app2-acme-acme-a1b2c3-by-ayush
+            |     |             |          |
+            |     env           cid        approver
+
+        Anything unparseable is returned as-is rather than guessed at - a
+        wrong audit record is worse than an incomplete one.
+        """
+        out = {"action": "", "env": "", "cid": "", "approver": ""}
+        if not name:
+            return out
+
+        head, _, rest = name.partition("-")
+        if head not in ("plan", "apply", "destroy") or not rest:
+            return out
+        out["action"] = head
+
+        if "-by-" in rest:
+            rest, _, approver = rest.rpartition("-by-")
+            out["approver"] = approver
+
+        parts = rest.split("-")
+        # A generated correlation id ends in six hex characters; a manual or
+        # pull-request run does not.
+        if len(parts) >= 2 and len(parts[-1]) == 6 and all(
+            c in "0123456789abcdef" for c in parts[-1]
+        ):
+            out["cid"] = "-".join(parts[-2:])
+            out["env"] = "-".join(parts[:-2])
+        else:
+            out["cid"] = parts[-1] if len(parts) > 1 else ""
+            out["env"] = "-".join(parts[:-1]) if len(parts) > 1 else rest
+
+        return out
+
+    def list_runs(self, workflows: Optional[tuple] = None,
+                  per_workflow: int = 20) -> list[dict]:
+        """
+        Recent runs across the deployment workflows, newest first.
+
+        A workflow that does not exist yet (destroy.yml before it is merged)
+        is skipped rather than failing the whole listing.
+        """
+        rows: list[dict] = []
+        for wf in (workflows or self.AUDIT_WORKFLOWS):
+            try:
+                data = self._call(
+                    "GET", f"/repos/{self.repo}/actions/workflows/{wf}/runs",
+                    params={"per_page": per_workflow},
+                )
+            except GitHubError:
+                continue
+
+            for r in data.get("workflow_runs", []):
+                name = r.get("name") or ""
+                fields = self.parse_run_name(name)
+                rows.append({
+                    **fields,
+                    "id": r["id"],
+                    "name": name,
+                    "status": r["status"],
+                    "conclusion": r.get("conclusion"),
+                    "created_at": r.get("run_started_at") or r.get("created_at") or "",
+                    "actor": (r.get("triggering_actor") or {}).get("login", ""),
+                    "url": r["html_url"],
+                })
+
+        rows.sort(key=lambda x: x["created_at"], reverse=True)
+        return rows
+
     def run_logs(self, run_id: int, tail: int = 80) -> str:
         """
         Last N lines, for the SRE agent. Never the whole log - Groq's free

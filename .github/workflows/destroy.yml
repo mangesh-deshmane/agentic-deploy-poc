@@ -1,0 +1,160 @@
+name: destroy
+
+# Tears down ONE environment. The counterpart to apply, and deliberately the
+# most defensive workflow in the repo.
+#
+# Guards, in order:
+#   1. env_name must match the naming pattern (blocks path traversal)
+#   2. envs/<env_name>.tfvars must exist and be committed
+#   3. the tfvars must not be marked protected = true
+#   4. confirm must repeat the env_name exactly
+#   5. the plan is shown and the destroy count asserted before applying
+#
+# scripts/destroy.sh remains the real safety net: it sweeps by label and does
+# not depend on Terraform state being intact. This workflow is the convenient
+# path, not the guaranteed one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: 'Environment file stem to destroy'
+        required: true
+        type: string
+      confirm:
+        description: 'Repeat the environment name exactly to confirm'
+        required: true
+        type: string
+      approver:
+        description: 'Who approved this teardown (recorded in the audit trail)'
+        required: true
+        type: string
+      correlation_id:
+        description: 'Correlation id from the originating request'
+        required: false
+        default: 'manual'
+        type: string
+
+run-name: destroy-${{ inputs.env_name }}-${{ inputs.correlation_id }}-by-${{ inputs.approver }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ENV_NAME: ${{ inputs.env_name }}
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          printf '%s' "$ENV_NAME" | grep -qE '^[a-z][a-z0-9-]{0,39}$' || {
+            echo "::error::env_name '$ENV_NAME' is not a valid environment name"; exit 1; }
+
+          # A typo in the UI should not destroy a neighbouring environment.
+          if [ "${{ inputs.confirm }}" != "$ENV_NAME" ]; then
+            echo "::error::confirmation '${{ inputs.confirm }}' does not match env_name '$ENV_NAME'"
+            exit 1
+          fi
+
+          test -f "envs/${ENV_NAME}.tfvars" || {
+            echo "::error::envs/${ENV_NAME}.tfvars not found - nothing to destroy"; exit 1; }
+
+          # An escape hatch for anything that must survive a teardown: set
+          # protected = true in the tfvars and this workflow refuses it.
+          if grep -qE '^\s*protected\s*=\s*true' "envs/${ENV_NAME}.tfvars"; then
+            echo "::error::${ENV_NAME} is marked protected = true and will not be destroyed"
+            exit 1
+          fi
+
+          echo "Destroying environment: $ENV_NAME"
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ vars.GCP_STATE_BUCKET }}" \
+            -backend-config="prefix=state/${ENV_NAME}"
+
+      # Planned first so the summary records exactly what was removed, and so
+      # a destroy that would touch nothing fails loudly instead of reporting
+      # success against an empty state.
+      - name: Plan the destroy
+        id: plan
+        working-directory: terraform
+        run: |
+          terraform plan -destroy -out=tfdestroy -input=false \
+            -var-file="../envs/${ENV_NAME}.tfvars"
+          terraform show -json tfdestroy > tfdestroy.json
+
+          COUNT=$(python3 -c "
+          import json
+          d = json.load(open('tfdestroy.json'))
+          print(sum(1 for c in d.get('resource_changes', [])
+                    if 'delete' in c['change']['actions']))
+          ")
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Resources to destroy: $COUNT"
+
+          if [ "$COUNT" = "0" ]; then
+            echo "::error::state for ${ENV_NAME} holds no resources - already destroyed, or the state prefix is wrong"
+            exit 1
+          fi
+
+      - name: Terraform destroy
+        id: destroy
+        working-directory: terraform
+        run: terraform apply -input=false -auto-approve tfdestroy
+
+      # Terraform reporting success is not the same as the service being gone.
+      - name: Verify the service is gone
+        id: verify
+        run: |
+          APP=$(grep -oP '^app\s*=\s*"\K[a-z0-9]+' "envs/${ENV_NAME}.tfvars")
+          CUST=$(grep -oP '^customer\s*=\s*"\K[a-z0-9-]+' "envs/${ENV_NAME}.tfvars")
+          ENVN=$(grep -oP '^env_name\s*=\s*"\K[a-z0-9-]+' "envs/${ENV_NAME}.tfvars")
+          REGION=$(grep -oP '^region\s*=\s*"\K[a-z0-9-]+' "envs/${ENV_NAME}.tfvars")
+          SVC="${APP}-${CUST}-${ENVN}"
+
+          if gcloud run services describe "$SVC" \
+               --project="${{ vars.GCP_PROJECT_ID }}" \
+               --region="$REGION" >/dev/null 2>&1; then
+            echo "::error::$SVC still exists in $REGION after destroy"
+            exit 1
+          fi
+          echo "verified: $SVC is gone from $REGION"
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Destroy: \`${ENV_NAME}\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Approved by | ${{ inputs.approver }} |"
+            echo "| Correlation id | ${{ inputs.correlation_id }} |"
+            echo "| Resources planned for deletion | ${{ steps.plan.outputs.count }} |"
+            echo "| Destroy | ${{ steps.destroy.outcome }} |"
+            echo "| Verified gone | ${{ steps.verify.outcome }} |"
+            echo ""
+            echo "The tfvars file is left in the repository. Remove it in a"
+            echo "pull request if this environment should not be re-creatable."
+          } >> "$GITHUB_STEP_SUMMARY"
