@@ -55,7 +55,21 @@ class GitHub:
 
     # ---- plumbing ----
     def _call(self, method: str, path: str, **kw):
-        r = self.s.request(method, f"{API}{path}", timeout=30, **kw)
+        # Every transport failure becomes a GitHubError. This class promises
+        # callers one exception type; letting a requests exception escape made
+        # a momentary network problem crash the whole Streamlit page rather
+        # than degrade one panel.
+        try:
+            r = self.s.request(method, f"{API}{path}", timeout=30, **kw)
+        except requests.exceptions.ConnectionError as err:
+            raise GitHubError(
+                "Cannot reach api.github.com. Check the network, then reload."
+            ) from err
+        except requests.exceptions.Timeout as err:
+            raise GitHubError("api.github.com timed out after 30s.") from err
+        except requests.exceptions.RequestException as err:
+            raise GitHubError(f"GitHub request failed: {err}") from err
+
         if r.status_code >= 400:
             raise GitHubError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
         return r.json() if r.content else None
@@ -202,13 +216,22 @@ class GitHub:
         is skipped rather than failing the whole listing.
         """
         rows: list[dict] = []
-        for wf in (workflows or self.AUDIT_WORKFLOWS):
+        targets = workflows or self.AUDIT_WORKFLOWS
+        failures = 0
+
+        for wf in targets:
             try:
                 data = self._call(
                     "GET", f"/repos/{self.repo}/actions/workflows/{wf}/runs",
                     params={"per_page": per_workflow},
                 )
             except GitHubError:
+                # One workflow failing is expected - destroy.yml does not exist
+                # until it is merged. Every workflow failing means GitHub could
+                # not be reached, and that must not be reported to the caller as
+                # an empty history: "nothing happened" and "I could not check"
+                # are different answers.
+                failures += 1
                 continue
 
             for r in data.get("workflow_runs", []):
@@ -225,6 +248,12 @@ class GitHub:
                     "url": r["html_url"],
                 })
 
+        if failures == len(targets):
+            raise GitHubError(
+                "Could not read run history from GitHub - this is not the same "
+                "as there being no deployments."
+            )
+
         rows.sort(key=lambda x: x["created_at"], reverse=True)
         return rows
 
@@ -233,8 +262,12 @@ class GitHub:
         Last N lines, for the SRE agent. Never the whole log - Groq's free
         tier allows 12k tokens a minute and a CI log is far larger than that.
         """
-        r = self.s.get(f"{API}/repos/{self.repo}/actions/runs/{run_id}/logs",
-                       timeout=60, allow_redirects=True)
+        try:
+            r = self.s.get(f"{API}/repos/{self.repo}/actions/runs/{run_id}/logs",
+                           timeout=60, allow_redirects=True)
+        except requests.exceptions.RequestException:
+            # No logs is a degraded explanation, not a reason to fail the page.
+            return ""
         if r.status_code >= 400:
             return ""
         import io

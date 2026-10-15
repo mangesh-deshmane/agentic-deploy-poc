@@ -507,14 +507,30 @@ def environments_panel():
         st.caption("No environments registered yet.")
         return
 
+    # Two tfvars files can describe the same app, customer and environment and
+    # therefore the same service name, while keeping separate Terraform state.
+    # The stem is the real identity - it is the state prefix, and it is what
+    # the destroy button acts on - so the stem is the heading.
+    seen = {}
+    for e in envs:
+        seen.setdefault(e["service"], []).append(e["stem"])
+
     for e in envs:
         c1, c2 = st.columns([4, 1])
         with c1:
-            st.markdown(f"**`{e['service']}`**")
+            st.markdown(f"**`{e['stem']}`**")
             st.caption(
-                f"{e['app']} · {e['customer']} · {e['env']} · {e['region']}"
+                f"service `{e['service']}` · {e['app']} · {e['customer']} · "
+                f"{e['env']} · {e['region']}"
                 + (" · protected" if e["protected"] else "")
             )
+            clash = [s for s in seen[e["service"]] if s != e["stem"]]
+            if clash:
+                st.caption(
+                    f"⚠️ shares the service name `{e['service']}` with "
+                    f"`{', '.join(clash)}` — deploying both would make them "
+                    f"fight over one Cloud Run service from separate states."
+                )
         with c2:
             if e["protected"]:
                 st.button("Protected", key=f"d-{e['stem']}", disabled=True,
@@ -533,10 +549,16 @@ def environments_panel():
 
 
 def audit_panel():
+    # A panel must never be able to take the page down with it. The audit
+    # trail is the least important thing on screen and the only one that
+    # needs the network on every render, so it fails quietly and in place.
     try:
         rows = gh().list_runs()
     except GitHubError as err:
-        st.error(str(err))
+        st.warning(f"Audit trail unavailable — {err}")
+        return
+    except Exception as err:                                  # noqa: BLE001
+        st.warning(f"Audit trail unavailable — {type(err).__name__}: {err}")
         return
 
     rows = [r for r in rows if r["action"]]
@@ -575,7 +597,8 @@ def audit_panel():
 if stage == "destroy_confirm":
     e = st.session_state.destroy_env
     with st.chat_message("assistant"):
-        st.warning(f"**Destroy `{e['service']}`?**")
+        st.warning(f"**Destroy `{e['stem']}`?**")
+        st.caption(f"Cloud Run service `{e['service']}` in `{e['region']}`.")
         st.caption(
             "This removes the Cloud Run service and everything else in that "
             "environment's Terraform state. Documents already written to "
