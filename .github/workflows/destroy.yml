@@ -132,13 +132,35 @@ jobs:
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
           echo "Resources to destroy: $COUNT"
 
+          # Empty state has two very different meanings. If the service is
+          # also absent from the project, the environment is simply already
+          # gone and a teardown has nothing to do - that is success, and it
+          # makes the destroy button safe to press twice. If the service IS
+          # still there, state and reality disagree: either the prefix is
+          # wrong or something was created outside Terraform, and that must
+          # be loud rather than reported as a clean teardown.
           if [ "$COUNT" = "0" ]; then
-            echo "::error::state for ${ENV_NAME} holds no resources - already destroyed, or the state prefix is wrong"
-            exit 1
+            APP=$(grep -oP '^app\s*=\s*"\K[a-z0-9]+' "$TFV" || true)
+            CUST=$(grep -oP '^customer\s*=\s*"\K[a-z0-9-]+' "$TFV" || true)
+            ENVN=$(grep -oP '^env_name\s*=\s*"\K[a-z0-9-]+' "$TFV" || true)
+            REG=$(grep -oP '^region\s*=\s*"\K[a-z0-9-]+' "$TFV" || true)
+            SVC="${APP}-${CUST}-${ENVN}"
+
+            if gcloud run services describe "$SVC" \
+                 --project="${{ vars.GCP_PROJECT_ID }}" \
+                 --region="${REG:-us-central1}" >/dev/null 2>&1; then
+              echo "::error::state for ${ENV_NAME} is empty but $SVC still exists - the state prefix is wrong, or it was created outside Terraform. Run scripts/destroy.sh, which sweeps by label."
+              exit 1
+            fi
+
+            echo "::notice::${ENV_NAME} has no resources and $SVC does not exist - nothing to tear down. A plan the policy gate denied never created anything."
+            echo "nothing_to_do=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
       - name: Terraform destroy
         id: destroy
+        if: steps.plan.outputs.nothing_to_do != 'true'
         working-directory: terraform
         run: terraform apply -input=false -auto-approve tfdestroy
 
