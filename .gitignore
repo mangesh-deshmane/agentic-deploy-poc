@@ -10,3 +10,6 @@ crash.log
 node_modules/
 .venv/
 .streamlit/
+__pycache__/
+*.pyc
+runs.jsonl

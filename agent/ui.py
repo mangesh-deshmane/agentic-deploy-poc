@@ -28,9 +28,13 @@ try:
 except ImportError:
     pass
 
-from agent import catalog, intake, planner                        # noqa: E402
+# catalog and planner remain only for the sidebar's blueprint list and the
+# tfvars reader; everything on the deploy path now goes through mcp_client.
+from agent import catalog, intake, planner                         # noqa: E402
+from agent import mcp_client                                       # noqa: E402
 from agent.github_ops import GitHub, GitHubError                   # noqa: E402
 from agent.llm import LLMUnavailable, available as llm_available   # noqa: E402
+from agent.mcp_client import MCPUnavailable                        # noqa: E402
 
 st.set_page_config(page_title="Pipeline Pilot", page_icon="▲", layout="centered")
 
@@ -58,9 +62,11 @@ def init():
         "msgs": [],
         "intent": None, "request": None, "resolution": None,
         "tfvars": None, "cid": None, "branch": None, "env_stem": None,
-        "pr_url": None, "plan_run": None, "apply_run": None,
+        "pr_url": None, "pr_number": None, "merge_note": None,
+        "plan_run": None, "apply_run": None,
         "stage": "idle", "clarify": 0, "failure": None,
         "destroy_env": None, "destroy_run": None, "destroy_cid": None,
+        "blueprint": None, "summary": None, "trace": [],
     }.items():
         st.session_state.setdefault(k, v)
 
@@ -70,10 +76,64 @@ init()
 
 def reset_request():
     for k in ("intent", "request", "resolution", "tfvars", "cid", "branch",
-              "env_stem", "pr_url", "plan_run", "apply_run", "failure"):
+              "env_stem", "pr_url", "pr_number", "merge_note",
+              "plan_run", "apply_run", "failure", "blueprint", "summary"):
         st.session_state[k] = None
     st.session_state.stage = "idle"
     st.session_state.clarify = 0
+    st.session_state.trace = []
+
+
+# ------------------------------------------------------- the tool layer ---
+# Every read and every write below goes through the MCP server, the same
+# interface an outside agent uses. The UI holds no privileged shortcut: if
+# something cannot be done through a tool, the UI cannot do it either.
+#
+# The two exceptions are deliberate and are the whole point of the design:
+# approving a plan and applying it are NOT tools, so they stay on the UI's
+# own code path. An agent can prepare; only a person here can apply.
+def tool(name: str, **args) -> dict:
+    """Call an MCP tool and record it, so the UI can show what it called."""
+    import time
+
+    t0 = time.time()
+    try:
+        out = mcp_client.call(name, **args)
+    except MCPUnavailable as err:
+        st.session_state.trace.append(
+            {"tool": name, "ok": None, "ms": 0, "error": str(err)})
+        raise
+    st.session_state.trace.append({
+        "tool": name,
+        "ok": out.get("ok"),
+        "ms": int((time.time() - t0) * 1000),
+    })
+    return out
+
+
+def resolve_and_render(req, ttl_hours: int) -> tuple[bool, dict]:
+    """
+    Check the request against the catalog and render its configuration,
+    both through the tool layer.
+
+    Returns (ok, payload). On refusal the payload carries the reason and the
+    alternatives; on success it carries the correlation id, the rendered
+    tfvars and the summary - so the bytes shown to the approver are the ones
+    prepare_deployment will commit against the same correlation id.
+    """
+    args = dict(app=req.app.value, cloud=req.cloud.value,
+                env=req.env_name.value, customer=req.customer,
+                region=req.region or "", ttl_hours=ttl_hours)
+
+    sup = tool("check_supported", app=args["app"], cloud=args["cloud"],
+               region=args["region"])
+    if not sup.get("ok"):
+        return False, sup
+
+    rc = tool("render_config", **args)
+    if not rc.get("ok"):
+        return False, rc
+    return True, rc
 
 
 def say(role, text, spec=None):
@@ -103,6 +163,18 @@ with st.sidebar:
     st.markdown("### Status")
     st.markdown(f"{'🟢' if llm_available() else '🔴'} Groq")
     st.markdown(f"{'🟢' if os.getenv('GITHUB_TOKEN') else '🔴'} GitHub")
+
+    # Checked once per session - each probe spawns the server, which costs a
+    # second, and a sidebar is redrawn on every interaction.
+    if "mcp_tools" not in st.session_state:
+        try:
+            st.session_state.mcp_tools = mcp_client.list_tools()
+        except MCPUnavailable:
+            st.session_state.mcp_tools = []
+    n = len(st.session_state.mcp_tools)
+    st.markdown(f"{'🟢' if n else '🔴'} MCP tool layer")
+    if n:
+        st.caption(f"{n} tools · every action below goes through them")
     st.caption(f"model · `{os.getenv('GROQ_MODEL_INTENT', 'default')}`")
 
     st.markdown("### Catalog")
@@ -165,25 +237,29 @@ if stage in ("idle", "clarify"):
                 st.rerun()
 
             req = intent.to_request()
-            res = catalog.resolve(req)
-            st.session_state.request, st.session_state.resolution = req, res
+            st.session_state.request = req
+            st.session_state.trace = []
 
-            if not res.ok:
-                opts = " · ".join(f"`{a}`" for a in res.available_alternatives)
+            ok, out = resolve_and_render(req, intent.ttl_hours or 24)
+            st.session_state.resolution = out
+
+            if not ok:
+                opts = " · ".join(f"`{a}`" for a in out.get("alternatives", []))
                 say("assistant",
-                    f"**I can't deploy that.**\n\n{res.reason.strip()}\n\n"
-                    f"What I can deploy: {opts}\n\n"
-                    f"_No pull request was opened and no cloud API was called._")
+                    f"**I can't deploy that.**\n\n{out['reason'].strip()}"
+                    + (f"\n\nWhat I can deploy: {opts}" if opts else "")
+                    + "\n\n_No pull request was opened and no cloud API was called._")
                 log({"event": "rejected", "app": req.app.value,
-                     "cloud": req.cloud.value, "reason": res.reason.strip()})
+                     "cloud": req.cloud.value, "reason": out["reason"].strip()})
                 st.session_state.stage = "idle"
                 st.session_state.intent = None
                 st.rerun()
 
-            cid = f"{planner.slug(req.customer)}-{uuid.uuid4().hex[:6]}"
-            st.session_state.cid = cid
-            st.session_state.tfvars = planner.render(req, res.blueprint_key, cid)
-            s = planner.summary(req, res.blueprint_key)
+            st.session_state.cid = out["correlation_id"]
+            st.session_state.tfvars = (out["tfvars_path"], out["tfvars"])
+            st.session_state.blueprint = out["blueprint"]
+            st.session_state.summary = out["summary"]
+            s = out["summary"]
 
             say("assistant",
                 f"I'll deploy **{s['Application']}** for **{s['Customer']}** "
@@ -205,6 +281,13 @@ if stage in ("idle", "clarify"):
                 f"You can still deploy using the form below.")
             st.session_state.stage = "manual"
             st.rerun()
+        except MCPUnavailable as err:
+            say("assistant",
+                f"The tool server didn't answer.\n\n`{err}`\n\n"
+                f"Nothing was created. Check that `mcp_server` is importable "
+                f"from this directory.")
+            st.session_state.stage = "idle"
+            st.rerun()
 
 # ---- 2. manual fallback ----------------------------------------------------
 if stage == "manual":
@@ -220,18 +303,27 @@ if stage == "manual":
             if st.form_submit_button("Resolve", type="primary"):
                 intent = intake.manual_intent(app, cloud, env, cust, int(ttl))
                 req = intent.to_request()
-                res = catalog.resolve(req)
                 st.session_state.intent = intent
-                st.session_state.request, st.session_state.resolution = req, res
+                st.session_state.request = req
+                st.session_state.trace = []
                 say("user", f"deploy {app} on {cloud} for {cust} to {env}")
-                if not res.ok:
-                    say("assistant", f"**I can't deploy that.**\n\n{res.reason.strip()}")
+                try:
+                    ok, out = resolve_and_render(req, int(ttl))
+                except MCPUnavailable as err:
+                    say("assistant", f"The tool server didn't answer.\n\n`{err}`")
+                    st.session_state.stage = "idle"
+                    st.rerun()
+
+                st.session_state.resolution = out
+                if not ok:
+                    say("assistant", f"**I can't deploy that.**\n\n{out['reason'].strip()}")
                     st.session_state.stage = "idle"
                 else:
-                    cid = f"{planner.slug(req.customer)}-{uuid.uuid4().hex[:6]}"
-                    st.session_state.cid = cid
-                    st.session_state.tfvars = planner.render(req, res.blueprint_key, cid)
-                    s = planner.summary(req, res.blueprint_key)
+                    st.session_state.cid = out["correlation_id"]
+                    st.session_state.tfvars = (out["tfvars_path"], out["tfvars"])
+                    st.session_state.blueprint = out["blueprint"]
+                    st.session_state.summary = out["summary"]
+                    s = out["summary"]
                     say("assistant",
                         f"I'll deploy **{s['Application']}** for **{s['Customer']}**.",
                         spec={"service": s["Service name"], "runtime": s["Runtime"],
@@ -243,6 +335,12 @@ if stage == "manual":
 if stage == "confirm":
     path, content = st.session_state.tfvars
     with st.chat_message("assistant"):
+        if st.session_state.trace:
+            calls = " → ".join(
+                f"{t['tool']}{'' if t['ok'] else ' ✕'}"
+                for t in st.session_state.trace)
+            st.caption(f"via the tool layer: `{calls}`")
+
         with st.expander(f"Configuration I'll commit · `{path}`"):
             st.code(content, language="hcl")
             st.caption("Rendered from a template. The model chose values for a "
@@ -250,34 +348,43 @@ if stage == "confirm":
         a, b = st.columns([1, 1])
         if a.button("Prepare deployment", type="primary", use_container_width=True):
             try:
-                g = gh()
                 req = st.session_state.request
                 cid = st.session_state.cid
-                branch = f"deploy/{cid}"
-                stem = Path(path).stem
 
-                g.create_branch(branch)
-                g.put_file(branch, path, content,
-                           f"Deploy {req.app.value} for {planner.slug(req.customer)}")
-                pr = g.open_pr(
-                    branch,
-                    f"Deploy {req.app.value} · {planner.slug(req.customer)} · {req.env_name.value}",
-                    f"Requested through the agent.\n\nCorrelation `{cid}`\n\n"
-                    f"The policy gate runs against the plan. Nothing is applied "
-                    f"until a human approves.")
-                g.dispatch("plan.yml", branch,
-                           {"env_name": stem, "correlation_id": cid})
+                # Through the tool layer, with the correlation id from
+                # render_config - so what gets committed is exactly what was
+                # shown above, not a second render that ought to match.
+                out = tool("prepare_deployment",
+                           app=req.app.value, cloud=req.cloud.value,
+                           env=req.env_name.value, customer=req.customer,
+                           region=req.region or "",
+                           ttl_hours=req.ttl_hours,
+                           correlation_id=cid)
 
-                st.session_state.branch = branch
-                st.session_state.env_stem = stem
-                st.session_state.pr_url = pr["html_url"]
+                if not out.get("ok"):
+                    say("assistant",
+                        f"**Could not prepare the deployment.**\n\n"
+                        f"{out.get('reason', 'unknown')}")
+                    st.session_state.stage = "idle"
+                    st.rerun()
+
+                st.session_state.branch = out["branch"]
+                st.session_state.env_stem = out["env_stem"]
+                st.session_state.pr_url = out["pr_url"]
+                st.session_state.pr_number = out["pr_number"]
                 say("assistant",
-                    f"Opened [pull request #{pr['number']}]({pr['html_url']}) and "
+                    f"Opened [pull request #{out['pr_number']}]({out['pr_url']}) and "
                     f"started the plan. Building the image, planning the change, "
                     f"then the policy gate.")
-                log({"event": "planning", "cid": cid, "pr": pr["html_url"],
-                     "app": req.app.value, "env": stem})
+                log({"event": "planning", "cid": cid, "pr": out["pr_url"],
+                     "app": req.app.value, "env": out["env_stem"]})
                 st.session_state.stage = "planning"
+                st.rerun()
+            except MCPUnavailable as err:
+                say("assistant",
+                    f"The tool server didn't answer.\n\n`{err}`\n\n"
+                    f"Nothing was created.")
+                st.session_state.stage = "idle"
                 st.rerun()
             except GitHubError as err:
                 say("assistant", f"GitHub rejected the request.\n\n`{err}`")
@@ -357,8 +464,9 @@ if stage == "planning":
 # ---- 5. gate B: approve the plan ------------------------------------------
 if stage == "approve":
     with st.chat_message("assistant"):
-        s = planner.summary(st.session_state.request,
-                            st.session_state.resolution.blueprint_key)
+        # The summary render_config already returned - no second computation
+        # that could disagree with what the approver reviewed.
+        s = st.session_state.summary or {}
         st.markdown(
             f"**The policy gate passed.** Ready to deploy `{s['Service name']}`.")
         st.caption(
@@ -406,6 +514,17 @@ if stage == "applying":
                 run, failed = show_run(st.session_state.apply_run, "Deploy")
                 if run.finished:
                     if run.ok:
+                        # The apply succeeded, so this environment now exists.
+                        # Merging makes main say so - until this, main had no
+                        # record of anything that had been deployed, and the
+                        # Environments list could not know about it.
+                        if st.session_state.pr_number:
+                            st.session_state.merge_note = g.merge_pr(
+                                st.session_state.pr_number)
+                            log({"event": "pr_merged",
+                                 "cid": st.session_state.cid,
+                                 "pr": st.session_state.pr_number,
+                                 "result": st.session_state.merge_note})
                         st.session_state.stage = "done"
                     else:
                         st.session_state.failure = explain_failure(
@@ -429,6 +548,8 @@ if stage == "done":
         st.markdown(
             f"[Open the run](https://github.com/{os.getenv('GITHUB_REPO','')}"
             f"/actions/runs/{st.session_state.apply_run}) for the service URL.")
+        if st.session_state.merge_note:
+            st.caption(st.session_state.merge_note)
         if st.button("Deploy something else", type="primary"):
             reset_request()
             st.rerun()
@@ -502,7 +623,20 @@ def local_envs() -> list[dict]:
 
 
 def environments_panel():
-    envs = local_envs()
+    # Through the tool layer, so this panel shows exactly what an outside
+    # agent calling list_environments would see.
+    try:
+        out = mcp_client.call("list_environments")
+        envs = [
+            {"stem": e["env_stem"], "app": e["app"], "customer": e["customer"],
+             "env": e["environment"], "region": e["region"],
+             "protected": e["protected"], "service": e["service"]}
+            for e in out.get("environments", [])
+        ] if out.get("ok") else []
+    except Exception as err:                                  # noqa: BLE001
+        st.warning(f"Could not list environments — {err}")
+        envs = local_envs()          # fall back to reading the files directly
+
     if not envs:
         st.caption("No environments registered yet.")
         return
@@ -518,9 +652,13 @@ def environments_panel():
     for e in envs:
         c1, c2 = st.columns([4, 1])
         with c1:
-            st.markdown(f"**`{e['stem']}`**")
+            # The service name leads, because that is what a person thinks of
+            # as "the thing that is running". The stem follows, because it is
+            # the Terraform state prefix and therefore what Destroy acts on -
+            # and when two environments collide, it is the only difference.
+            st.markdown(f"**`{e['service']}`**")
             st.caption(
-                f"service `{e['service']}` · {e['app']} · {e['customer']} · "
+                f"env `{e['stem']}` · {e['app']} · {e['customer']} · "
                 f"{e['env']} · {e['region']}"
                 + (" · protected" if e["protected"] else "")
             )
@@ -553,10 +691,17 @@ def audit_panel():
     # trail is the least important thing on screen and the only one that
     # needs the network on every render, so it fails quietly and in place.
     try:
-        rows = gh().list_runs()
-    except GitHubError as err:
-        st.warning(f"Audit trail unavailable — {err}")
-        return
+        out = mcp_client.call("get_audit_trail", limit=25)
+        if not out.get("ok"):
+            st.warning(f"Audit trail unavailable — {out.get('reason')}")
+            return
+        rows = [
+            {"action": e["action"], "env": e["environment"],
+             "approver": e["approved_by"] or "", "actor": e["requested_by"] or "",
+             "cid": e["correlation_id"], "conclusion": e["result"],
+             "created_at": e["at"], "url": e["run"]}
+            for e in out["entries"]
+        ]
     except Exception as err:                                  # noqa: BLE001
         st.warning(f"Audit trail unavailable — {type(err).__name__}: {err}")
         return
@@ -597,8 +742,8 @@ def audit_panel():
 if stage == "destroy_confirm":
     e = st.session_state.destroy_env
     with st.chat_message("assistant"):
-        st.warning(f"**Destroy `{e['stem']}`?**")
-        st.caption(f"Cloud Run service `{e['service']}` in `{e['region']}`.")
+        st.warning(f"**Destroy `{e['service']}`?**")
+        st.caption(f"Environment `{e['stem']}` in `{e['region']}`.")
         st.caption(
             "This removes the Cloud Run service and everything else in that "
             "environment's Terraform state. Documents already written to "

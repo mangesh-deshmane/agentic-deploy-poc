@@ -111,6 +111,36 @@ class GitHub:
                           json={"title": title, "body": body,
                                 "head": branch, "base": base})
 
+    def merge_pr(self, number: int, method: str = "squash",
+                 delete_branch: bool = True) -> str:
+        """
+        Merge a deploy PR once its apply has succeeded, so main becomes the
+        register of what exists rather than a pile of open proposals.
+
+        Returns a short human-readable outcome. Never raises: a failed merge
+        is a bookkeeping problem, and the deployment it describes already
+        succeeded - reporting it as a failure would be a lie.
+        """
+        try:
+            self._call("PUT", f"/repos/{self.repo}/pulls/{number}/merge",
+                       json={"merge_method": method})
+        except GitHubError as err:
+            msg = str(err)
+            if "405" in msg or "409" in msg:
+                return (f"PR #{number} could not be merged automatically "
+                        f"(conflict or branch protection) - merge it by hand.")
+            return f"PR #{number} merge failed: {msg[:120]}"
+
+        if delete_branch:
+            try:
+                pr = self._call("GET", f"/repos/{self.repo}/pulls/{number}")
+                ref = pr["head"]["ref"]
+                self._call("DELETE", f"/repos/{self.repo}/git/refs/heads/{ref}")
+            except GitHubError:
+                pass            # a leftover branch is harmless
+
+        return f"PR #{number} merged - the environment is now registered on main."
+
     # ---- running workflows ----
     def dispatch(self, workflow: str, ref: str, inputs: dict) -> None:
         """
